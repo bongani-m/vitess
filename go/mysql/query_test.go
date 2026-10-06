@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"reflect"
 	"sync"
 	"testing"
@@ -1194,5 +1195,73 @@ func TestComStmtPrepareMultiStmt (t *testing.T) {
 	if err := cConn.ExecuteStreamFetch(sql); err == nil {
 		t.Fatalf("expected error, but received nil")
 		return
+	}
+}
+
+// writeCountingConn counts Write calls on the server side of a socket pair.
+type writeCountingConn struct {
+	net.Conn
+	writes int
+}
+
+func (w *writeCountingConn) Write(b []byte) (int, error) {
+	w.writes++
+	return w.Conn.Write(b)
+}
+
+// prepareFieldsHandler returns result columns from ComPrepare.
+type prepareFieldsHandler struct {
+	testHandler
+	fields []*querypb.Field
+}
+
+func (h *prepareFieldsHandler) ComPrepare(ctx context.Context, c *Conn, query string, prepare *PrepareData) ([]*querypb.Field, error) {
+	return h.fields, nil
+}
+
+// TestComStmtPrepareSingleWrite checks that the prepare reply, which is one
+// packet per parameter and column, reaches the socket as one write.
+func TestComStmtPrepareSingleWrite(t *testing.T) {
+	listener, sConn, cConn := createSocketPair(t)
+	defer func() {
+		listener.Close()
+		sConn.Close()
+		cConn.Close()
+	}()
+
+	sql := "select id, name from test_table where id = ? and name = ?"
+	if err := cConn.writePacket(MockQueryPackets(t, sql)); err != nil {
+		t.Fatalf("writePacket failed: %v", err)
+	}
+
+	counter := &writeCountingConn{Conn: sConn.Conn}
+	sConn.Conn = counter
+	sConn.PrepareData = make(map[uint32]*PrepareData)
+	handler := &prepareFieldsHandler{fields: []*querypb.Field{
+		{Name: "id", Type: querypb.Type_INT32},
+		{Name: "name", Type: querypb.Type_VARCHAR},
+	}}
+	if err := sConn.handleNextCommand(context.Background(), handler); err != nil {
+		t.Fatalf("handleNextCommand failed: %v", err)
+	}
+	assert.Equal(t, 1, counter.writes)
+
+	// OK, two parameter definitions, two column definitions, and an EOF
+	// after each group unless the client deprecated EOF.
+	packets := 5
+	if sConn.Capabilities&CapabilityClientDeprecateEOF == 0 {
+		packets += 2
+	}
+	resp, err := cConn.ReadPacket(context.Background())
+	if err != nil {
+		t.Fatalf("cConn.ReadPacket failed: %v", err)
+	}
+	assert.Equal(t, byte(0x00), resp[0])
+	assert.Equal(t, uint16(2), uint16(resp[5])|uint16(resp[6])<<8, "columns")
+	assert.Equal(t, uint16(2), uint16(resp[7])|uint16(resp[8])<<8, "params")
+	for i := 1; i < packets; i++ {
+		if _, err := cConn.ReadPacket(context.Background()); err != nil {
+			t.Fatalf("cConn.ReadPacket %d failed: %v", i, err)
+		}
 	}
 }

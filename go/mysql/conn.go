@@ -1448,7 +1448,12 @@ func (c *Conn) handleNextCommand(ctx context.Context, handler Handler) error {
 			return nil
 		}
 
+		// writePrepare sends one packet per parameter and column. Buffer them
+		// so the reply is one socket write, as ComStmtExecute does.
+		// writePrepare flushes on success.
+		c.startWriterBuffering()
 		if err := c.writePrepare(ctx, fld, c.PrepareData[c.StatementID]); err != nil {
+			_ = c.flush(ctx)
 			return err
 		}
 	case ComStmtExecute:
